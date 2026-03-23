@@ -144,7 +144,7 @@ const AdminPage = () => {
         status: 'active',
       });
 
-      if (licError && !licError.message.includes('duplicate')) {
+      if (licError && licError.code !== '23505') {
         throw licError;
       }
 

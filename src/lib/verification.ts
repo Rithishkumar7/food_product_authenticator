@@ -90,21 +90,31 @@ export async function verifyProduct(
   const productName = details.productName || companyName || 'Unknown Product';
   const manufacturer = details.manufacturer || companyName || 'Unknown';
 
-  // Use upsert so repeated scans of the same license number update the
-  // existing row instead of inserting a new duplicate every time.
-  await supabase.from('products').upsert(
-    {
-      name: productName,
-      manufacturer,
-      license_number: licenseNumber,
-      batch_number: details.batchNumber || null,
-      status,
-      trust_score: trustScore,
-      verification_source: 'system',
-      verified_at: new Date().toISOString(),
-    },
-    { onConflict: 'license_number' }
-  );
+  // Check if an admin-verified product already exists for this license.
+  // If so, skip the upsert to preserve admin-set trust scores and statuses.
+  const { data: existingProduct } = await supabase
+    .from('products')
+    .select('id, is_admin_verified')
+    .eq('license_number', licenseNumber)
+    .maybeSingle();
+
+  if (!existingProduct?.is_admin_verified) {
+    // Use upsert so repeated scans of the same license number update the
+    // existing row instead of inserting a new duplicate every time.
+    await supabase.from('products').upsert(
+      {
+        name: productName,
+        manufacturer,
+        license_number: licenseNumber,
+        batch_number: details.batchNumber || null,
+        status,
+        trust_score: trustScore,
+        verification_source: 'system',
+        verified_at: new Date().toISOString(),
+      },
+      { onConflict: 'license_number' }
+    );
+  }
 
   return {
     isValid: status === 'genuine',

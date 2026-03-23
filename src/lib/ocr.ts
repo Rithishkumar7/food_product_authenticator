@@ -1,7 +1,7 @@
 import Tesseract from 'tesseract.js';
 import { ExtractedDetails } from '@/types/product';
 
-const TARGET_SIZE = 1400;
+const TARGET_SIZE = 1800; // larger = more detail for Tesseract
 let cachedWorker: Tesseract.Worker | null = null;
 let prewarmPromise: Promise<Tesseract.Worker> | null = null;
 
@@ -11,7 +11,10 @@ async function getWorker(): Promise<Tesseract.Worker> {
   prewarmPromise = (async () => {
     const worker = await Tesseract.createWorker('eng');
     await worker.setParameters({
-      tessedit_pageseg_mode: Tesseract.PSM.AUTO,
+      // SPARSE_TEXT handles mixed-layout labels much better than AUTO
+      tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
+      // Preserve digits; reduce garbage character output
+      tessedit_char_whitelist: '',
     });
     cachedWorker = worker;
     return worker;
@@ -36,23 +39,30 @@ function preprocessImage(file: File): Promise<string> {
       canvas.height = Math.round(img.height * scale);
 
       const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        resolve(url);
-        return;
-      }
+      if (!ctx) { resolve(url); return; }
 
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const data = imageData.data;
-      const threshold = 128;
 
+      // Compute average brightness to detect dark backgrounds
+      let totalBrightness = 0;
       for (let i = 0; i < data.length; i += 4) {
-        const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-        const contrast = 1.5;
-        const adjusted = Math.max(0, Math.min(255, ((gray / 255 - 0.5) * contrast + 0.5) * 255));
-        const val = adjusted > threshold ? 255 : 0;
-        data[i] = data[i + 1] = data[i + 2] = val;
+        totalBrightness += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      }
+      const avgBrightness = totalBrightness / (data.length / 4);
+      const isDark = avgBrightness < 100;
+
+      // Apply contrast enhancement (not hard binarization — preserves anti-aliased edges)
+      const contrast = 1.8;
+      for (let i = 0; i < data.length; i += 4) {
+        let gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        // Invert dark backgrounds so text becomes dark on light
+        if (isDark) gray = 255 - gray;
+        const enhanced = Math.max(0, Math.min(255, ((gray / 255 - 0.5) * contrast + 0.5) * 255));
+        data[i] = data[i + 1] = data[i + 2] = enhanced;
+        // alpha unchanged
       }
 
       ctx.putImageData(imageData, 0, 0);
@@ -61,91 +71,118 @@ function preprocessImage(file: File): Promise<string> {
       resolve(result);
     };
 
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error('Failed to load image'));
-    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Failed to load image')); };
     img.src = url;
   });
 }
 
-function normalizeForFSSAI(text: string): string {
-  return text
-    .replace(/[oOQ]/g, '0')
-    .replace(/[lI|]/g, '1')
-    .replace(/[sS]/g, '5')
-    .replace(/[bB]/g, '8');
-}
-
+// Conservative substitution — only very safe OCR confusables for digit sequences
 function toDigits(s: string): string {
   return s
     .replace(/[oOQ]/g, '0')
-    .replace(/[lI|]/g, '1')
-    .replace(/[sS]/g, '5')
-    .replace(/[bB]/g, '8')
+    .replace(/[lI|!]/g, '1')
     .replace(/[zZ]/g, '2')
-    .replace(/[gG]/g, '6')
-    .replace(/[tT]/g, '7')
+    .replace(/[sS$]/g, '5')   // $ can look like 5
+    .replace(/[bB]/g, '8')
     .replace(/\D/g, '');
 }
 
-function extractFSSAINumber(text: string): string | undefined {
-  const raw = text.replace(/\s+/g, ' ');
-  const normalized = normalizeForFSSAI(raw);
+// Join space-separated digit groups then extract a 14-digit FSSAI number
+function normaliseFSSAICandidate(raw: string): string | undefined {
+  // Remove spaces between digit groups to handle "1002 0021 0001 23" style
+  const joined = raw.replace(/\s+/g, '');
+  const digits = toDigits(joined);
+  if (digits.length >= 12 && digits.length <= 16) {
+    const trimmed = digits.slice(0, 14).padStart(14, '0').slice(-14);
+    return trimmed;
+  }
+  return undefined;
+}
 
+function extractFSSAINumber(text: string): string | undefined {
+  // Patterns ordered by specificity — most specific first
   const contextPatterns = [
-    /FSSAI\s*(?:Lic(?:ense)?\.?\s*(?:No\.?|Number)?\s*:?\s*)?([\d\sOoQlI|sSbBzZgGtT]{12,20})/i,
-    /FSSAI\s*(?:Reg\.?\s*No\.?|No\.?)?\s*:?\s*([\d\sOoQlI|sSbBzZgGtT]{12,20})/i,
-    /Lic(?:ense)?\.?\s*(?:No\.?|Number)?\s*:?\s*([\d\sOoQlI|sSbBzZgGtT]{12,20})/i,
-    /(?:License|Licence)\s*(?:No\.?|Number)?\s*:?\s*([\d\sOoQlI|sSbBzZgGtT]{12,20})/i,
-    /(?:Reg(?:istration)?\.?\s*(?:No\.?)?\s*:?\s*)([\d\sOoQlI|sSbBzZgGtT]{12,20})/i,
-    /(?:Food\s*)?(?:Safety\s*)?(?:Lic\.?\s*No\.?)?\s*:?\s*([\d\sOoQlI|sSbBzZgGtT]{12,20})/i,
+    // FSSAI Lic No. / FSSAI License Number / FSSAI Reg No.
+    /FSSAI\s*(?:Lic(?:ense|ence)?\.?\s*)?(?:No\.?|Number|Reg\.?\s*No\.?)?\s*:?\s*([\d\s oOQlI|!sSbB]{11,22})/i,
+    // "License No" or "Lic. No" preceded by any text
+    /Lic(?:ense|ence)?\.?\s*No\.?\s*:?\s*([\d\s oOQlI|!sSbB]{11,22})/i,
+    /Reg(?:istration)?\.?\s*No\.?\s*:?\s*([\d\s oOQlI|!sSbB]{11,22})/i,
   ];
 
   for (const pattern of contextPatterns) {
-    for (const src of [raw, normalized]) {
-      const m = src.match(pattern);
-      if (m) {
-        const digits = toDigits(m[1]);
-        if (digits.length >= 12 && digits.length <= 14) {
-          return digits.slice(0, 14).padStart(14, '0').slice(-14);
-        }
-      }
+    const m = text.match(pattern);
+    if (m) {
+      const result = normaliseFSSAICandidate(m[1]);
+      if (result) return result;
     }
   }
 
-  const digitBlock = /[\dOoQlI|sSbBzZgGtT]{12,20}/g;
-  const blocks = raw.match(digitBlock) || [];
+  // Fallback: scan all contiguous digit-like blocks of 12-16 chars
+  const blocks = text.match(/[\d oOQlI|!sSbB]{12,20}/g) ?? [];
   for (const block of blocks) {
-    const digits = toDigits(block);
-    if (digits.length >= 12 && digits.length <= 14) {
-      return digits.slice(0, 14).padStart(14, '0').slice(-14);
-    }
+    // Only try blocks that are mostly digits/digit-lookalikes
+    if (/[a-df-ruw-z]/i.test(block)) continue; // skip if real letters present
+    const result = normaliseFSSAICandidate(block);
+    if (result) return result;
   }
 
-  const fallback = text.match(/\d{10,}/g);
-  if (fallback) {
-    for (const seq of fallback) {
-      const digits = seq.replace(/\D/g, '');
-      if (digits.length >= 12 && digits.length <= 14) {
-        return digits.padStart(14, '0').slice(-14);
-      }
+  // Last resort: any 12-14 digit sequence
+  const sequences = text.match(/\d[\d\s]{10,13}\d/g) ?? [];
+  for (const seq of sequences) {
+    const digits = seq.replace(/\s/g, '');
+    if (digits.length >= 12 && digits.length <= 14) {
+      return digits.padStart(14, '0').slice(-14);
     }
   }
 
   return undefined;
 }
 
+function extractBatchNumber(text: string): string | undefined {
+  const patterns = [
+    /(?:Batch|Lot|Mfg\.?\s*Batch)\s*(?:No\.?|Code|Number)?\s*:?\s*([A-Z0-9][\w/-]{2,20})/i,
+    /B\.?\s*No\.?\s*:?\s*([A-Z0-9][\w/-]{2,20})/i,
+  ];
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) return m[1].trim();
+  }
+  return undefined;
+}
+
+function extractLicenseDate(text: string): string | undefined {
+  const patterns = [
+    /(?:Mfg\.?|Manufactured|Mfg\.?\s*Date|Date\s*of\s*Mfg\.?)\s*:?\s*([\d]{1,2}[/-][\d]{1,2}[/-][\d]{2,4})/i,
+    /(?:Mfg\.?|Manufactured)\s*:?\s*([\d]{1,2}[/-][\d]{2,4})/i,
+    /(?:Best\s*Before|Use\s*By|Expiry)\s*:?\s*([\d]{1,2}[/-][\d]{1,2}[/-][\d]{2,4})/i,
+  ];
+  for (const p of patterns) {
+    const m = text.match(p);
+    if (m) return m[1].trim();
+  }
+  return undefined;
+}
+
+function extractNetWeight(text: string): string | undefined {
+  const m = text.match(/(?:Net\s*(?:Weight|Wt\.?|Content)|Contents?)\s*:?\s*([\d.,]+\s*(?:g|kg|ml|l|oz|lb)s?)/i);
+  return m ? m[1].trim() : undefined;
+}
+
+function extractMRP(text: string): string | undefined {
+  const m = text.match(/(?:M\.?R\.?P\.?|MRP|Price)\s*(?:\(Incl(?:usive)?\.?\s*of\s*all\s*taxes?\)?)?\s*:?\s*(?:Rs\.?|₹|INR)?\s*([\d,]+(?:\.\d{1,2})?)/i);
+  return m ? `₹${m[1].replace(/,/g, '')}` : undefined;
+}
+
 function extractProductName(text: string): string | undefined {
   const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.length > 2);
   const skipPatterns =
-    /^(license|fssai|batch|mfg|manufactured|packed|ingredients|weight|mrp|net\s*w|best\s*before|use\s*by|date|reg|nutritional|storage|contains|allergen|m\.r\.p|\d{10,})/i;
+    /^(license|fssai|batch|lot|mfg|manufactured|packed|ingredients|weight|mrp|net\s*w|best\s*before|use\s*by|date|reg|nutritional|storage|contains|allergen|m\.r\.p|\d{10,}|serving|energy|protein|carb|fat|sodium|sugar)/i;
 
+  // Explicit label patterns first
   const labelPatterns = [
     /(?:Product|Brand)\s*(?:Name)?\s*:?\s*(.+?)$/im,
     /(?:Name\s*of\s*(?:the\s*)?(?:Food|Product))\s*:?\s*(.+?)$/im,
   ];
-
   for (const p of labelPatterns) {
     const m = text.match(p);
     if (m) {
@@ -154,6 +191,7 @@ function extractProductName(text: string): string | undefined {
     }
   }
 
+  // All-caps lines (often the product headline on Indian labels)
   const capsLines = lines.filter(
     (l) =>
       l.replace(/[^a-zA-Z]/g, '').length > 2 &&
@@ -162,19 +200,14 @@ function extractProductName(text: string): string | undefined {
       !/^\d+[\s.,-]*$/.test(l) &&
       l.length < 60
   );
-
   for (const line of capsLines.slice(0, 5)) {
     const cleaned = line.replace(/[|_~`®™©]/g, '').trim();
     if (cleaned.length > 2) return cleaned;
   }
 
+  // First meaningful non-skipped line
   for (const line of lines.slice(0, 10)) {
-    if (
-      line.length > 2 &&
-      line.length < 60 &&
-      !skipPatterns.test(line) &&
-      !/^\d+[\s.,-]*$/.test(line)
-    ) {
+    if (line.length > 2 && line.length < 60 && !skipPatterns.test(line) && !/^\d+[\s.,-]*$/.test(line)) {
       const cleaned = line.replace(/[|_~`®™©]/g, '').trim();
       if (cleaned.length > 2) return cleaned;
     }
@@ -185,15 +218,14 @@ function extractProductName(text: string): string | undefined {
 
 function extractManufacturer(text: string): string | undefined {
   const patterns = [
-    /(?:Mfg\.?\s*(?:by)?|Manufactured\s*by|Packed\s*by|Marketed\s*by)\s*:?\s*(.+?)(?:\n|,\s*(?:Plot|Survey|Address))/i,
+    /(?:Mfg\.?\s*(?:by)?|Manufactured\s*by|Packed\s*by|Marketed\s*by)\s*:?\s*(.+?)(?:\n|,\s*(?:Plot|Survey|Address|Ph\.|Tel\.))/i,
     /(?:Mfg\.?\s*(?:by)?|Manufactured\s*by|Packed\s*by|Marketed\s*by)\s*:?\s*(.+?)$/im,
   ];
-
   for (const p of patterns) {
     const m = text.match(p);
     if (m) {
       let name = m[1].trim().replace(/[,.]$/, '').trim();
-      name = name.replace(/\s*(Plot|Survey|Village|Dist|At|Address).*$/i, '').trim();
+      name = name.replace(/\s*(Plot|Survey|Village|Dist|At|Address|Ph\.|Tel\.|www\.).*$/i, '').trim();
       if (name.length > 2 && name.length < 100) return name;
     }
   }
@@ -212,10 +244,16 @@ export async function performOCR(
   const { data } = await worker.recognize(processedImage);
 
   const rawText = data.text;
+
+  onProgress?.('Extracting product details...');
   const details: ExtractedDetails = {
     licenseNumber: extractFSSAINumber(rawText),
     manufacturer: extractManufacturer(rawText),
     productName: extractProductName(rawText),
+    batchNumber: extractBatchNumber(rawText),
+    licenseDate: extractLicenseDate(rawText),
+    netWeight: extractNetWeight(rawText),
+    mrp: extractMRP(rawText),
   };
 
   return { details, rawText };

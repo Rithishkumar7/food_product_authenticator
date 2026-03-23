@@ -7,7 +7,7 @@
  *   https://supabase.com/dashboard/account/tokens
  */
 
-const PROJECT_REF = 'mjvsshxqoovhyprbssdm';
+const PROJECT_REF = 'klgkwiyopulsmszhgtmw';
 const token = process.argv[2];
 
 if (!token) {

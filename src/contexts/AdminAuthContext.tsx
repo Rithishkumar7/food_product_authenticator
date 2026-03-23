@@ -30,17 +30,14 @@ export function AdminAuthProvider({ children }: { children: React.ReactNode }) {
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
       setUser(session?.user ?? null);
+      setLoading(false);
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
   const login = async (email: string, password: string) => {
-    let { error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error?.message?.includes('Invalid') || error?.message?.toLowerCase().includes('invalid')) {
-      const { error: signUpError } = await supabase.auth.signUp({ email, password });
-      if (!signUpError) return { error: null };
-    }
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
     return { error: error as Error | null };
   };
 
